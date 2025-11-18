@@ -17,9 +17,11 @@ Args = struct('LabelsOff',0,'GroupPlots',1,'GroupPlotIndex',1,'Color','b', ...
 		  'ReturnVars',{''}, 'ArgsOnly',0, 'Cmds','', 'Errorbar',0, ...
           'Shuffle',0, 'ShuffleSteps',100, 'NumSubPlots',4, ...
           'Map',0,'Smooth',1,'SIC',0,'Radii',0,'MinDur',0,'Filtered',1,...
-          'SortByRatio',0,'Details',1,'RateBins',0,'MapOnly',0,'plotmap',0);
-Args.flags = {'LabelsOff','ArgsOnly','Errorbar','SIC','Shuffle','MapOnly','plotmap'};
+          'SortByRatio',0,'Details',1,'RateBins',0,'MapOnly',0,'plotmap',0, 'Occupancy', 0, 'outline',0, 'outline_threshold',0.75);
+Args.flags = {'LabelsOff','ArgsOnly','Errorbar','SIC','Shuffle','MapOnly','plotmap', 'Occupancy', 'outline'};
 [Args,varargin2] = getOptArgs(varargin,Args);
+
+figure; 
 
 if Args.plotmap
 % Insert floor place map into larger 3D view setting
@@ -142,6 +144,33 @@ if Args.ArgsOnly
     return;
 end
 
+if Args.Occupancy
+    
+    % Extract floor portion of duration map
+    if Args.Smooth
+        dur_map = obj.data.dur_adsm; %smooth 
+    else
+        dur_map = obj.data.dur_raw; %raw data
+    end
+    
+    % Check if we need to extract floor only (for 3D environment)
+    if length(dur_map) > 1600
+        dur_floor = dur_map(3:1602);  % Floor only
+    else
+        dur_floor = dur_map;  % Already floor only
+    end
+    
+    % Plot occupancy map
+    imagesc(flipud(reshape(dur_floor, 40, 40)'));
+    colorbar;
+    title('Occupancy Map (Duration) - Floor Only');
+    xlabel('X Position');
+    ylabel('Y Position');
+    axis square;
+    colormap jet;
+end
+
+
 if(~isempty(Args.NumericArguments))
 	% plot one data set at a time
 % 	n = get(gcf,'UserData');
@@ -170,14 +199,16 @@ if(~isempty(Args.NumericArguments))
         set(next_handle,'Callback',{@forwardcallback, length(obj.data.origin), Args, gcf, obj, 'SIC'});
         set(prev_handle,'Callback',{@backcallback, Args, gcf, obj, 'SIC'});         
         
-    elseif(Args.Details)
+    elseif(Args.Details && ~Args.Occupancy)
         set(gca,'visible','off');
+        
         if Args.MapOnly
             h0 = axes('Position',[0.1 0.1 0.8 0.8]);
         else
             h0 = axes('Position',[0.3 0.5 0.4 0.4]);
         end
         set(h0,'Tag','top');
+        
         if Args.Smooth
             map_choice = obj.data.maps_adsm(n,:);
         else
@@ -185,6 +216,99 @@ if(~isempty(Args.NumericArguments))
         end
         im0 = imagesc(reshape(map_choice,sqrt(length(map_choice)),sqrt(length(map_choice))), 'Tag','toppic');
         colorbar();  
+        
+        grid_size = sqrt(length(map_choice));
+        map_2d = reshape(map_choice, grid_size, grid_size); 
+        if Args.outline
+            % Use outline_threshold as percentile (default 0.75 if not specified)
+            threshold_percentile = 0.75;
+            if isfield(Args, 'outline_threshold')
+                threshold_percentile = Args.outline_threshold;
+            end
+            
+            % Get all regions with peaks above mean + 2*std
+            [region_cells, peak_indices, peak_values] = get_outline(obj, ...
+                'threshold', threshold_percentile, ...
+                'Smooth', Args.Smooth, ...
+                'CellIndex', n);
+            
+            if ~isempty(region_cells)
+                % Use RED for all regions
+                region_color = [1.0, 0.0, 0.0];  % Red only
+                
+                % Create RGB image for visualization
+                rgb_image = zeros(grid_size, grid_size, 3);
+                
+                % Initialize all as gray (maze areas outside regions)
+                for r = 1:grid_size
+                    for c = 1:grid_size
+                        if isnan(map_2d(r,c))
+                            % Background (non-maze) - WHITE
+                            rgb_image(r,c,:) = [1 1 1];
+                        else
+                            % Maze but outside region - GRAY
+                            rgb_image(r,c,:) = [0.7 0.7 0.7];
+                        end
+                    end
+                end
+                
+                % Color all regions in RED
+                num_regions = length(region_cells);
+                for reg = 1:num_regions
+                    region_idx = region_cells{reg};
+                    [rows, cols] = ind2sub([grid_size, grid_size], region_idx);
+                    
+                    % Use same red color for all regions
+                    for i = 1:length(rows)
+                        rgb_image(rows(i), cols(i), :) = region_color;
+                    end
+                end
+                
+                im0 = image(rgb_image);
+                set(im0, 'Tag', 'toppic');
+                set(gca, 'YDir', 'reverse'); % Match imagesc default orientation
+                axis equal tight;
+                
+                hold on;
+                % Mark all peaks with white stars
+                for reg = 1:num_regions
+                    [peak_row, peak_col] = ind2sub([grid_size, grid_size], peak_indices(reg));
+                    plot(peak_col, peak_row, 'w*', 'MarkerSize', 15, 'LineWidth', 2);
+                    
+                    % Optionally add text labels showing peak number
+                    text(peak_col, peak_row-1, sprintf('%d', reg), ...
+                        'Color', 'white', 'FontSize', 10, 'FontWeight', 'bold', ...
+                        'HorizontalAlignment', 'center', 'VerticalAlignment', 'bottom');
+                end
+                hold off;
+                
+                % Create detailed title
+                total_pixels = sum(cellfun(@length, region_cells));
+                title(sprintf('Cell %d | %d Regions | %.0f%% threshold | Total: %d pixels', ...
+                    n, num_regions, threshold_percentile*100, total_pixels));
+                
+                % Display info in console
+                fprintf('\n=== Cell %d Analysis ===\n', n);
+                fprintf('Threshold: %.0f%% of max firing rate\n', threshold_percentile*100);
+                fprintf('Number of regions found: %d\n', num_regions);
+                for reg = 1:num_regions
+                    fprintf('  Region %d: Peak = %.2f Hz, Size = %d pixels\n', ...
+                        reg, peak_values(reg), length(region_cells{reg}));
+                end
+                fprintf('========================\n\n');
+                
+            else
+                % No regions found
+                im0 = imagesc(map_2d, 'Tag', 'toppic');
+                colormap jet;
+                fprintf('No regions found above threshold\n');
+            end
+        else
+            % Normal plot without outline
+            im0 = imagesc(map_2d, 'Tag', 'toppic');
+        end
+        colorbar();
+        
         if ~Args.MapOnly     
             h1 = axes('Position',[0.1 0.1 0.8 0.3]);
             % what is the point of this plot?
